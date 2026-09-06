@@ -1,0 +1,29 @@
+# Data Processing
+pandas
+numpy
+
+# Web API
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# Graph Logic
+networkx
+
+# Vector Database
+chromadb
+
+# Code Parsing
+tree-sitter
+tree-sitter-python
+
+# PostgreSQL
+sqlalchemy
+psycopg[binary]
+
+# HTTP / Async Support
+httpx
+
+# Environment & Configuration
+python-dotenv
