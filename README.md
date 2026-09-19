@@ -37,14 +37,6 @@ The system integrates an AI-driven RAG pipeline to generate citation-grounded ex
 - [ ] Create Interactive Repository Visualization (React + TypeScript)
 - [ ] Dockerize & Automate Deployment (Docker Compose + GitHub Actions)
 
-# 🚀 RepoGraph AI
-
-> An agentic GitHub repository onboarding assistant that combines Knowledge Graphs, RAG, and interactive graph visualization to help developers understand large codebases.
-
-[Features] • [Architecture] • [Why Knowledge Graph?] • [Installation] • [Usage] • [Tech Stack]
-
----
-
 ## ✨ Overview
 
 Understanding a large GitHub repository can be difficult for new developers.
