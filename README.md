@@ -78,38 +78,39 @@ A GitHub repository is not simply a collection of files.
 
 It is a network of relationships between:
 
-```text
-Contributor
-     │
-     ├── contributed to ──> Commit
-     │                         │
-     │                         └── modified ──> File
-     │                                          │
-     │                                          └── contains ──> Function
-     │
-     └── reviewed ──> Pull Request
-                          │
-                          └── modifies ──> File
+```mermaid
+flowchart TB
 
-Our approach combines semantic retrieval with graph relationships.
+    subgraph Traditional["Traditional RAG / Code Search"]
+        direction TB
 
+        U1["User: Who worked on UserService?"]
 
-                 GitHub Repository
-                        │
-        ┌───────────────┴───────────────┐
-        ↓                               ↓
- Knowledge Graph                    Vector Store
-        │                               │
- Relationships                    Semantic Retrieval
-        │                               │
-        └───────────────┬───────────────┘
-                        ↓
-                       RAG
-                        ↓
-                  Context + Evidence
-                        ↓
-                       LLM
-                        ↓
-              Grounded Repository Answer
+        U1 --> SEARCH["Semantic / Keyword Search"]
+        SEARCH --> FILES["Retrieve relevant files"]
+        FILES --> CODE["Retrieve code snippets"]
+        CODE --> CONTEXT["Limited relationship context"]
+        CONTEXT --> LLM1["LLM"]
+        LLM1 --> OUT1["Answer"]
+    end
 
-This allows the system to understand not only what code exists, but also how contributors, files, functions, commits and pull requests are connected.
+    subgraph RG["RepoGraph AI"]
+        direction TB
+
+        U2["User: Who worked on UserService?"]
+
+        U2 --> AGENT["Agentic Query Understanding"]
+        AGENT --> GRAPH["Knowledge Graph"]
+
+        GRAPH --> REL["Contributor → Commit → File → Function"]
+        GRAPH --> PR["Contributor → Pull Request → File"]
+        GRAPH --> REVIEW["Contributor → Review → Pull Request"]
+
+        REL --> RETRIEVE["Graph + Semantic Retrieval"]
+        PR --> RETRIEVE
+        REVIEW --> RETRIEVE
+
+        RETRIEVE --> CONTEXT2["Relationship-aware context"]
+        CONTEXT2 --> LLM2["LLM / RAG"]
+        LLM2 --> OUT2["Grounded Answer + Citations"]
+    end
