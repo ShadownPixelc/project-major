@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
-import { ContributorNode, FileNode, AstFunctionNode, GraphNode, GraphEdge, NetworkStats } from '../types';
-import { ZoomIn, ZoomOut, RotateCcw, Compass, Layers, Info } from 'lucide-react';
+import { GraphNode, GraphEdge, NetworkStats } from '../types';
+import { ZoomIn, ZoomOut, RotateCcw, Compass } from 'lucide-react';
 
 interface GraphCanvasProps {
   nodes: GraphNode[];
@@ -11,6 +11,8 @@ interface GraphCanvasProps {
   networkStats?: NetworkStats;
   layoutMode?: 'constellation' | 'force';
 }
+
+const LASER_COLORS = new Set(['#ff1744', '#ffd600', '#00e5ff']);
 
 export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   nodes,
@@ -26,6 +28,14 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
   const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
   const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
 
+  // Always call the latest callback without rebuilding the simulation
+  const onSelectRef = useRef(onSelectNode);
+  onSelectRef.current = onSelectNode;
+
+  // ---------------------------------------------------------------------------
+  // Main effect: builds the graph. Selection is NOT a dependency, so clicking a
+  // node no longer re-randomises the layout.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!svgRef.current || !containerRef.current) return;
 
@@ -37,38 +47,25 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
 
-    // Definitions: Filters and Glow effects
+    // Glow filters
     const defs = svg.append('defs');
+    const addGlow = (id: string, deviation: string) => {
+      const f = defs.append('filter').attr('id', id).attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
+      f.append('feGaussianBlur').attr('stdDeviation', deviation).attr('result', 'coloredBlur');
+      const m = f.append('feMerge');
+      m.append('feMergeNode').attr('in', 'coloredBlur');
+      m.append('feMergeNode').attr('in', 'SourceGraphic');
+    };
+    addGlow('laser-crimson-glow', '4');
+    addGlow('laser-gold-glow', '3.5');
+    addGlow('laser-cyan-glow', '3');
 
-    // Laser Crimson Glow filter
-    const crimsonFilter = defs.append('filter').attr('id', 'laser-crimson-glow').attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
-    crimsonFilter.append('feGaussianBlur').attr('stdDeviation', '4').attr('result', 'coloredBlur');
-    const crimsonMerge = crimsonFilter.append('feMerge');
-    crimsonMerge.append('feMergeNode').attr('in', 'coloredBlur');
-    crimsonMerge.append('feMergeNode').attr('in', 'SourceGraphic');
-
-    // Laser Gold Glow filter
-    const goldFilter = defs.append('filter').attr('id', 'laser-gold-glow').attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
-    goldFilter.append('feGaussianBlur').attr('stdDeviation', '3.5').attr('result', 'coloredBlur');
-    const goldMerge = goldFilter.append('feMerge');
-    goldMerge.append('feMergeNode').attr('in', 'coloredBlur');
-    goldMerge.append('feMergeNode').attr('in', 'SourceGraphic');
-
-    // Laser Cyan Glow filter
-    const cyanFilter = defs.append('filter').attr('id', 'laser-cyan-glow').attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
-    cyanFilter.append('feGaussianBlur').attr('stdDeviation', '3').attr('result', 'coloredBlur');
-    const cyanMerge = cyanFilter.append('feMerge');
-    cyanMerge.append('feMergeNode').attr('in', 'coloredBlur');
-    cyanMerge.append('feMergeNode').attr('in', 'SourceGraphic');
-
-    // Root Group for Zoom & Pan
     const g = svg.append('g').attr('class', 'graph-viewport');
 
-    // Background Layer: Orbital Radar Rings (Matched directly to Image 2)
+    // Radar rings
     const radarGroup = g.append('g').attr('class', 'radar-grid');
     const maxRadius = Math.min(width, height) * 0.44;
     const ringRadii = [maxRadius * 0.28, maxRadius * 0.52, maxRadius * 0.76, maxRadius, maxRadius * 1.15];
-
     ringRadii.forEach((r, idx) => {
       radarGroup
         .append('circle')
@@ -80,31 +77,24 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         .attr('stroke-width', 1)
         .attr('stroke-dasharray', idx % 2 === 1 ? '3 5' : 'none');
     });
-
-    // Radial axis lines
     for (let angle = 0; angle < 360; angle += 45) {
       const rad = (angle * Math.PI) / 180;
-      const x2 = centerX + Math.cos(rad) * maxRadius * 1.15;
-      const y2 = centerY + Math.sin(rad) * maxRadius * 1.15;
       radarGroup
         .append('line')
         .attr('x1', centerX)
         .attr('y1', centerY)
-        .attr('x2', x2)
-        .attr('y2', y2)
+        .attr('x2', centerX + Math.cos(rad) * maxRadius * 1.15)
+        .attr('y2', centerY + Math.sin(rad) * maxRadius * 1.15)
         .attr('stroke', 'rgba(255, 255, 255, 0.04)')
         .attr('stroke-dasharray', '2 4');
     }
 
-    // Clone data for simulation to avoid mutating props directly
-    const nodesData = nodes.map((d, index) => {
-      const isFile = (d as any).type === 'file';
-      const isAst = (d as any).type === 'ast_function';
-      // Compute initial constellation orbital position
+    // Copy node data for the simulation (d3 mutates x/y/fx/fy)
+    const nodesData: any[] = nodes.map((d, index) => {
+      const type = (d as any).type;
       if (layoutMode === 'constellation') {
-        const total = nodes.length;
-        const angle = (index / total) * 2 * Math.PI;
-        const radius = isFile ? maxRadius * 0.95 : (isAst ? maxRadius * 0.75 : maxRadius * 0.42);
+        const angle = (index / Math.max(1, nodes.length)) * 2 * Math.PI;
+        const radius = type === 'file' ? maxRadius * 0.95 : type === 'ast_function' ? maxRadius * 0.75 : maxRadius * 0.42;
         return {
           ...d,
           x: centerX + Math.cos(angle) * radius + (Math.random() - 0.5) * 40,
@@ -114,47 +104,36 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       return { ...d, x: centerX + (Math.random() - 0.5) * 200, y: centerY + (Math.random() - 0.5) * 200 };
     });
 
-    // Build safe node ID index supporting lookup by ID, name, or label
-    const nodeById = new Map<string, string>();
-    nodesData.forEach((n: any) => {
-      if (n.id) nodeById.set(String(n.id), String(n.id));
-      if (n.name) nodeById.set(String(n.name), String(n.id));
-      if (n.label) nodeById.set(String(n.label), String(n.id));
-    });
-
-    // Safely resolve and filter edges so d3.forceLink never receives an unknown node ID
-    const edgesData = edges
-      .map((d) => {
-        const rawSource = typeof d.source === 'object' ? (d.source as any).id : d.source;
-        const rawTarget = typeof d.target === 'object' ? (d.target as any).id : d.target;
-        const resolvedSource = nodeById.get(String(rawSource));
-        const resolvedTarget = nodeById.get(String(rawTarget));
-
-        if (!resolvedSource || !resolvedTarget) {
-          return null;
-        }
-
-        return {
-          ...d,
-          source: resolvedSource,
-          target: resolvedTarget,
-        };
+    // Resolve edges strictly by node id; drop anything that does not resolve
+    const ids = new Set(nodesData.map((n) => String(n.id)));
+    const edgesData: any[] = edges
+      .map((e) => {
+        const s = typeof e.source === 'object' ? (e.source as any).id : e.source;
+        const t = typeof e.target === 'object' ? (e.target as any).id : e.target;
+        return ids.has(String(s)) && ids.has(String(t)) ? { ...e, source: String(s), target: String(t) } : null;
       })
       .filter((e): e is NonNullable<typeof e> => e !== null);
 
-    // Groups for Edge rendering
+    const isCollab = (d: any) => !d.type || d.type === 'collaboration';
+    const edgeColor = (d: any) =>
+      LASER_COLORS.has(d.color) ? d.color : d.type === 'contains' ? '#6b21a8' : 'rgba(255, 255, 255, 0.16)';
+    const edgeFilter = (d: any) =>
+      d.color === '#ff1744' ? 'url(#laser-crimson-glow)'
+      : d.color === '#ffd600' ? 'url(#laser-gold-glow)'
+      : d.color === '#00e5ff' ? 'url(#laser-cyan-glow)'
+      : null;
+
     const edgesGroup = g.append('g').attr('class', 'edges');
     const nodesGroup = g.append('g').attr('class', 'nodes');
 
-    // Simulation Setup
     const simulation = d3
-      .forceSimulation(nodesData as any)
+      .forceSimulation(nodesData)
       .force(
         'link',
         d3
           .forceLink(edgesData)
           .id((d: any) => d.id)
-          .distance((d: any) => (d.weight > 5 ? 110 : 160))
+          .distance((d: any) => (!isCollab(d) ? 90 : d.weight >= 6 ? 110 : 160))
           .strength(0.35)
       )
       .force('charge', d3.forceManyBody().strength((d: any) => (d.type === 'file' ? -350 : -250)))
@@ -164,48 +143,34 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
     if (layoutMode === 'constellation') {
       simulation.force(
         'radial',
-        d3.forceRadial(
-          (d: any) => (d.type === 'file' ? maxRadius * 0.92 : d.type === 'ast_function' ? maxRadius * 0.7 : maxRadius * 0.38),
-          centerX,
-          centerY
-        ).strength(0.55)
+        d3
+          .forceRadial(
+            (d: any) => (d.type === 'file' ? maxRadius * 0.92 : d.type === 'ast_function' ? maxRadius * 0.7 : maxRadius * 0.38),
+            centerX,
+            centerY
+          )
+          .strength(0.55)
       );
     }
 
-    // Render Edges
+    // Edges
     const linkElements = edgesGroup
       .selectAll('line')
       .data(edgesData)
       .enter()
       .append('line')
-      .attr('stroke', (d: any) => {
-        if (d.color === '#ff1744' || d.weight > 5) return '#ff1744';
-        if (d.color === '#ffd600' || d.pr_reviews > 0) return '#ffd600';
-        if (d.color === '#00e5ff') return '#00e5ff';
-        return 'rgba(255, 255, 255, 0.16)';
-      })
-      .attr('stroke-width', (d: any) => {
-        if (d.weight > 10) return 3.2;
-        if (d.weight > 4) return 2.4;
-        return 1.4;
-      })
-      .attr('stroke-opacity', (d: any) => (d.weight > 4 ? 0.95 : 0.6))
-      .attr('filter', (d: any) => {
-        if (d.color === '#ff1744' || d.weight > 5) return 'url(#laser-crimson-glow)';
-        if (d.color === '#ffd600' || d.pr_reviews > 0) return 'url(#laser-gold-glow)';
-        if (d.color === '#00e5ff') return 'url(#laser-cyan-glow)';
-        return null;
-      })
+      .attr('stroke', edgeColor)
+      .attr('stroke-width', (d: any) => (!isCollab(d) ? 1.2 : d.weight >= 6 ? 3.2 : d.weight >= 3 ? 2.4 : 1.4))
+      .attr('stroke-opacity', (d: any) => (isCollab(d) && d.weight >= 3 ? 0.95 : 0.6))
+      .attr('filter', edgeFilter)
       .attr('cursor', 'pointer')
       .on('mouseenter', (event, d: any) => {
         setHoveredEdge(d);
         setTooltipPos({ x: event.clientX, y: event.clientY });
       })
-      .on('mouseleave', () => {
-        setHoveredEdge(null);
-      });
+      .on('mouseleave', () => setHoveredEdge(null));
 
-    // Render Node Containers
+    // Nodes
     const nodeElements = nodesGroup
       .selectAll('g.node')
       .data(nodesData)
@@ -231,21 +196,17 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
             d.fy = null;
           })
       )
-      .on('click', (_event, d: any) => {
-        onSelectNode(d);
-      });
+      .on('click', (_event, d: any) => onSelectRef.current(d));
 
-    // Render specifics based on node type
     nodeElements.each(function (d: any) {
       const el = d3.select(this);
 
       if (d.type === 'file') {
-        // Render File Tablet Card (Matched to rectangular cards in Image 2)
         const cardW = 96;
         const cardH = 50;
 
-        // Card background
         el.append('rect')
+          .attr('class', 'node-ring')
           .attr('x', -cardW / 2)
           .attr('y', -cardH / 2)
           .attr('width', cardW)
@@ -253,11 +214,9 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           .attr('rx', 4)
           .attr('ry', 4)
           .attr('fill', '#0e0e15')
-          .attr('stroke', selectedNode?.id === d.id ? '#00e5ff' : '#28283a')
-          .attr('stroke-width', selectedNode?.id === d.id ? 2 : 1)
-          .attr('filter', selectedNode?.id === d.id ? 'url(#laser-cyan-glow)' : 'none');
+          .attr('stroke', '#28283a')
+          .attr('stroke-width', 1);
 
-        // File icon placeholder / mini symbol
         el.append('rect')
           .attr('x', -10)
           .attr('y', -16)
@@ -276,8 +235,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           .attr('stroke', '#64748b')
           .attr('stroke-width', 1);
 
-        // File label
-        const displayLabel = d.label.length > 13 ? d.label.substring(0, 11) + '..' : d.label;
+        const label = String(d.label || '');
         el.append('text')
           .attr('x', 0)
           .attr('y', 14)
@@ -285,13 +243,15 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           .attr('fill', '#cbd5e1')
           .attr('font-size', '9.5px')
           .attr('font-family', 'Fira Code, monospace')
-          .text(displayLabel);
+          .text(label.length > 13 ? label.substring(0, 11) + '..' : label);
+
+        el.append('title').text(`${d.full_path || label} (click to open on GitHub)`);
       } else if (d.type === 'ast_function') {
-        // AST Function node: Pill / Diamond tag
         const tagW = 75;
         const tagH = 26;
 
         el.append('rect')
+          .attr('class', 'node-ring')
           .attr('x', -tagW / 2)
           .attr('y', -tagH / 2)
           .attr('width', tagW)
@@ -303,6 +263,7 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           .attr('stroke-width', 1.5)
           .attr('filter', 'url(#laser-cyan-glow)');
 
+        const label = String(d.label || '');
         el.append('text')
           .attr('x', 0)
           .attr('y', 4)
@@ -310,28 +271,31 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           .attr('fill', '#e9d5ff')
           .attr('font-size', '9px')
           .attr('font-family', 'Fira Code, monospace')
-          .text(d.label.length > 10 ? d.label.substring(0, 9) + '..' : d.label);
+          .text(label.length > 10 ? label.substring(0, 9) + '..' : label);
+
+        el.append('title').text(
+          `${d.name || label} in ${d.file_path || ''}` +
+            (d.owner ? ` — owner: ${d.owner}${d.ownership_pct != null ? ` (${Math.round(d.ownership_pct)}%)` : ''}` : '')
+        );
       } else {
-        // Contributor Node (Matched directly to Image 2: Glowing Colored Orbs)
+        // Contributor
         const radius = 22;
         const color = d.color || '#00e5ff';
-        const isSelected = selectedNode?.id === d.id;
 
-        // Outer glow aura
         el.append('circle')
+          .attr('class', 'node-aura')
           .attr('r', radius + 5)
           .attr('fill', color)
-          .attr('opacity', isSelected ? 0.35 : 0.15)
+          .attr('opacity', 0.15)
           .attr('filter', color === '#ff1744' ? 'url(#laser-crimson-glow)' : 'url(#laser-cyan-glow)');
 
-        // Outer neon perimeter ring
         el.append('circle')
+          .attr('class', 'node-ring')
           .attr('r', radius)
           .attr('fill', '#09090e')
           .attr('stroke', color)
-          .attr('stroke-width', isSelected ? 3.5 : 2.5);
+          .attr('stroke-width', 2.5);
 
-        // Inner Badge Number (e.g. 01, 02, 03... as in Image 2)
         el.append('text')
           .attr('x', 0)
           .attr('y', 5)
@@ -340,28 +304,28 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           .attr('font-size', '12px')
           .attr('font-weight', '700')
           .attr('font-family', 'Fira Code, monospace')
-          .text(d.badge || d.id.substring(0, 2).toUpperCase());
+          .text(d.badge || String(d.id).substring(0, 2).toUpperCase());
 
-        // Contributor Name below node with high-contrast pill
-        const displayName = d.name || d.label || d.id || 'Contributor';
+        const displayName = String(d.name || d.label || d.id || 'Contributor');
         const pillW = Math.min(Math.max(displayName.length * 7.2 + 14, 48), 120);
-        const pillH = 18;
 
         el.append('rect')
+          .attr('class', 'node-pill')
           .attr('x', -pillW / 2)
           .attr('y', radius + 6)
           .attr('width', pillW)
-          .attr('height', pillH)
+          .attr('height', 18)
           .attr('rx', 4)
           .attr('fill', '#090912')
-          .attr('stroke', isSelected ? color : 'rgba(255, 255, 255, 0.15)')
-          .attr('stroke-width', isSelected ? 1.5 : 1);
+          .attr('stroke', 'rgba(255, 255, 255, 0.15)')
+          .attr('stroke-width', 1);
 
         el.append('text')
+          .attr('class', 'node-name')
           .attr('x', 0)
           .attr('y', radius + 19)
           .attr('text-anchor', 'middle')
-          .attr('fill', isSelected ? '#ffffff' : '#f1f5f9')
+          .attr('fill', '#f1f5f9')
           .attr('font-size', '10.5px')
           .attr('font-weight', '600')
           .attr('font-family', 'Inter, system-ui, sans-serif')
@@ -369,55 +333,88 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
       }
     });
 
-    // Update positions on simulation tick
     simulation.on('tick', () => {
       linkElements
         .attr('x1', (d: any) => d.source.x)
         .attr('y1', (d: any) => d.source.y)
         .attr('x2', (d: any) => d.target.x)
         .attr('y2', (d: any) => d.target.y);
-
       nodeElements.attr('transform', (d: any) => `translate(${d.x}, ${d.y})`);
     });
 
-    // Zoom and Pan handling
     const zoom = d3
       .zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.3, 3])
-      .on('zoom', (event) => {
-        g.attr('transform', event.transform);
-      });
-
+      .on('zoom', (event) => g.attr('transform', event.transform));
     zoomBehaviorRef.current = zoom;
     svg.call(zoom);
 
     return () => {
       simulation.stop();
     };
-  }, [nodes, edges, selectedNode, layoutMode]);
+  }, [nodes, edges, layoutMode]);
 
-  // Zoom control helpers
+  // ---------------------------------------------------------------------------
+  // Selection highlight: restyles existing elements, never rebuilds the graph.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!svgRef.current) return;
+    d3.select(svgRef.current)
+      .selectAll<SVGGElement, any>('g.node')
+      .each(function (d) {
+        const on = d.id === selectedNode?.id;
+        const el = d3.select(this);
+        const ring = el.select('.node-ring');
+
+        if (d.type === 'file') {
+          ring
+            .attr('stroke', on ? '#00e5ff' : '#28283a')
+            .attr('stroke-width', on ? 2 : 1)
+            .attr('filter', on ? 'url(#laser-cyan-glow)' : null);
+        } else if (d.type !== 'ast_function') {
+          const color = d.color || '#00e5ff';
+          ring.attr('stroke-width', on ? 3.5 : 2.5);
+          el.select('.node-aura').attr('opacity', on ? 0.35 : 0.15);
+          el.select('.node-pill')
+            .attr('stroke', on ? color : 'rgba(255, 255, 255, 0.15)')
+            .attr('stroke-width', on ? 1.5 : 1);
+          el.select('.node-name').attr('fill', on ? '#ffffff' : '#f1f5f9');
+        }
+      });
+  }, [selectedNode, nodes, edges, layoutMode]);
+
+  // Zoom controls
   const handleZoomIn = () => {
     if (svgRef.current && zoomBehaviorRef.current) {
       d3.select(svgRef.current).transition().duration(250).call(zoomBehaviorRef.current.scaleBy, 1.25);
     }
   };
-
   const handleZoomOut = () => {
     if (svgRef.current && zoomBehaviorRef.current) {
       d3.select(svgRef.current).transition().duration(250).call(zoomBehaviorRef.current.scaleBy, 0.8);
     }
   };
-
   const handleResetZoom = () => {
     if (svgRef.current && zoomBehaviorRef.current) {
       d3.select(svgRef.current).transition().duration(300).call(zoomBehaviorRef.current.transform, d3.zoomIdentity);
     }
   };
 
+  const tooltipTitle = (e: GraphEdge) =>
+    e.type === 'authored_file' ? 'Authored File'
+    : e.type === 'owns_ast_function' ? 'Function Ownership'
+    : e.type === 'contains' ? 'File contains Function'
+    : 'Collaboration Connection';
+
   return (
     <div ref={containerRef} className="relative w-full h-full bg-[#060609] overflow-hidden select-none">
       <svg ref={svgRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
+
+      {nodes.length === 0 && (
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-slate-500 pointer-events-none">
+          No contributors found for this repository in the sampled history.
+        </div>
+      )}
 
       {/* Floating Canvas Controls */}
       <div className="absolute bottom-5 right-5 flex items-center gap-1.5 p-1.5 rounded-lg bg-slate-900/80 border border-slate-800 backdrop-blur-md z-10 shadow-xl">
@@ -437,14 +434,14 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         </button>
         <button
           onClick={handleResetZoom}
-          title="Reset Constellation View"
+          title="Reset View"
           className="p-2 rounded hover:bg-slate-800 text-slate-300 hover:text-white transition-colors cursor-pointer"
         >
           <RotateCcw className="w-4 h-4" />
         </button>
       </div>
 
-      {/* Legend & Laser Color Indicators - Matched to Image 2 Palette */}
+      {/* Legend */}
       <div className="absolute top-5 left-5 p-3 rounded-xl bg-slate-950/80 border border-slate-800/80 backdrop-blur-md z-10 text-xs shadow-2xl flex flex-col gap-2 pointer-events-none">
         <div className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold flex items-center gap-1.5">
           <Compass className="w-3.5 h-3.5 text-cyan-400" />
@@ -452,16 +449,22 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
         </div>
         <div className="flex items-center gap-2">
           <div className="w-4 h-0.5 bg-[#ff1744] shadow-[0_0_8px_#ff1744]" />
-          <span className="text-slate-300">Co-Editing / Heavy Dependency</span>
+          <span className="text-slate-300">Strong collaboration (co-edits / reviews)</span>
         </div>
         <div className="flex items-center gap-2">
           <div className="w-4 h-0.5 bg-[#ffd600] shadow-[0_0_8px_#ffd600]" />
-          <span className="text-slate-300">Pull Request Review Link</span>
+          <span className="text-slate-300">Includes PR reviews</span>
         </div>
         <div className="flex items-center gap-2">
           <div className="w-4 h-0.5 bg-[#00e5ff] shadow-[0_0_8px_#00e5ff]" />
-          <span className="text-slate-300">Tree-sitter AST Function Link</span>
+          <span className="text-slate-300">Co-edits / function ownership</span>
         </div>
+        {networkStats && (
+          <div className="text-[10px] text-slate-500 pt-1 border-t border-slate-800">
+            {networkStats.total_contributors} contributors • {networkStats.total_collaborations} links • density{' '}
+            {networkStats.graph_density}
+          </div>
+        )}
       </div>
 
       {/* Edge Hover Tooltip */}
@@ -470,16 +473,29 @@ export const GraphCanvas: React.FC<GraphCanvasProps> = ({
           style={{ top: tooltipPos.y - 120, left: tooltipPos.x - 100 }}
           className="fixed pointer-events-none z-30 p-2.5 rounded-lg bg-slate-900 border border-slate-700 text-xs shadow-2xl backdrop-blur-md max-w-xs"
         >
-          <div className="font-semibold text-cyan-300 mb-1">Collaboration Connection</div>
-          <div className="text-slate-300">
-            Co-edits: <span className="font-bold text-white">{hoveredEdge.co_edits || 0}</span>
-          </div>
-          <div className="text-slate-300">
-            PR Reviews: <span className="font-bold text-white">{hoveredEdge.pr_reviews || 0}</span>
-          </div>
-          {hoveredEdge.shared_files && hoveredEdge.shared_files.length > 0 && (
-            <div className="text-slate-400 text-[10px] mt-1 font-mono truncate">
-              Files: {hoveredEdge.shared_files.join(', ')}
+          <div className="font-semibold text-cyan-300 mb-1">{tooltipTitle(hoveredEdge)}</div>
+          {(!hoveredEdge.type || hoveredEdge.type === 'collaboration') && (
+            <>
+              <div className="text-slate-300">
+                Co-edits: <span className="font-bold text-white">{hoveredEdge.co_edits || 0}</span>
+              </div>
+              <div className="text-slate-300">
+                PR Reviews: <span className="font-bold text-white">{hoveredEdge.pr_reviews || 0}</span>
+              </div>
+              <div className="text-slate-300">
+                Shared function ownership:{' '}
+                <span className="font-bold text-white">{hoveredEdge.function_co_ownership || 0}</span>
+              </div>
+              {hoveredEdge.shared_files && hoveredEdge.shared_files.length > 0 && (
+                <div className="text-slate-400 text-[10px] mt-1 font-mono truncate">
+                  Files: {hoveredEdge.shared_files.join(', ')}
+                </div>
+              )}
+            </>
+          )}
+          {hoveredEdge.type === 'authored_file' && (
+            <div className="text-slate-300">
+              Commits to this file (sampled): <span className="font-bold text-white">{hoveredEdge.commits ?? 0}</span>
             </div>
           )}
         </div>
