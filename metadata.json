@@ -1,0 +1,6 @@
+{
+  "name": "Equinox - Contributor Graph Visualizer & RAG Onboarding",
+  "description": "Repo-Contributor Graph Visualizer with NetworkX, Tree-sitter AST function attribution, ChromaDB RAG, and D3.js interactive graphs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
