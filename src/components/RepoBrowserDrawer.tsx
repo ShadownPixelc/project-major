@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { RepoAnalysisData } from '../types';
-import { FolderGit2, ExternalLink, GitCommit, GitPullRequest, FileCode, X, Search, ShieldCheck } from 'lucide-react';
+import { FolderGit2, ExternalLink, GitCommit, GitPullRequest, FileCode, X, Search } from 'lucide-react';
 
 interface RepoBrowserDrawerProps {
   isOpen: boolean;
@@ -15,22 +15,20 @@ export const RepoBrowserDrawer: React.FC<RepoBrowserDrawerProps> = ({ isOpen, on
   if (!isOpen) return null;
 
   const repoUrl = repoData.repo_url || `https://github.com/${repoData.repo_name}`;
+  const q = filterQuery.toLowerCase();
 
-  const filteredFiles = (repoData.files || []).filter((f) =>
-    f.path.toLowerCase().includes(filterQuery.toLowerCase())
-  );
+  const filteredFiles = (repoData.files || []).filter((f) => f.path.toLowerCase().includes(q));
 
+  // author can be null for commits/PRs not linked to a GitHub account
   const filteredCommits = (repoData.commits || []).filter(
     (c) =>
-      c.message.toLowerCase().includes(filterQuery.toLowerCase()) ||
-      c.author.toLowerCase().includes(filterQuery.toLowerCase()) ||
-      c.sha.toLowerCase().includes(filterQuery.toLowerCase())
+      c.message.toLowerCase().includes(q) ||
+      (c.author ?? '').toLowerCase().includes(q) ||
+      c.sha.toLowerCase().includes(q)
   );
 
   const filteredPrs = (repoData.prs || []).filter(
-    (pr) =>
-      pr.title.toLowerCase().includes(filterQuery.toLowerCase()) ||
-      pr.author.toLowerCase().includes(filterQuery.toLowerCase())
+    (pr) => pr.title.toLowerCase().includes(q) || (pr.author ?? '').toLowerCase().includes(q)
   );
 
   return (
@@ -125,11 +123,12 @@ export const RepoBrowserDrawer: React.FC<RepoBrowserDrawerProps> = ({ isOpen, on
         <div className="p-4 flex-1 overflow-y-auto space-y-2">
           {activeTab === 'files' && (
             <div className="space-y-2">
+              {filteredFiles.length === 0 && <div className="text-xs text-slate-500">No files match.</div>}
               {filteredFiles.map((file, idx) => {
-                const fileUrl = file.file_url || `${repoUrl}/blob/main/${file.path}`;
+                const fileUrl = file.file_url || `${repoUrl}/blob/HEAD/${file.path}`;
                 return (
                   <div
-                    key={idx}
+                    key={`${file.path}-${idx}`}
                     className="p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 hover:border-slate-700 flex items-center justify-between transition-colors group"
                   >
                     <div className="truncate mr-3">
@@ -137,8 +136,9 @@ export const RepoBrowserDrawer: React.FC<RepoBrowserDrawerProps> = ({ isOpen, on
                         <FileCode className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                         <span>{file.path}</span>
                       </div>
-                      <div className="text-[10px] text-slate-500 mt-0.5">
-                        {file.language} • {file.lines} lines
+                      <div className="text-[10px] text-slate-500 mt-0.5 truncate">
+                        {file.language}
+                        {file.lines ? ` • ${file.lines} lines` : ''}
                         {file.contributors && file.contributors.length > 0 && ` • By ${file.contributors.join(', ')}`}
                       </div>
                     </div>
@@ -161,18 +161,19 @@ export const RepoBrowserDrawer: React.FC<RepoBrowserDrawerProps> = ({ isOpen, on
 
           {activeTab === 'commits' && (
             <div className="space-y-2">
+              {filteredCommits.length === 0 && <div className="text-xs text-slate-500">No commits match.</div>}
               {filteredCommits.map((c, idx) => {
-                const commitUrl = c.commit_url || `${repoUrl}/commit/${c.sha}`;
+                const commitUrl = c.commit_url || (c as any).url || `${repoUrl}/commit/${c.sha}`;
                 return (
                   <div
-                    key={idx}
+                    key={`${c.sha}-${idx}`}
                     className="p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 hover:border-slate-700 flex items-center justify-between transition-colors"
                   >
                     <div className="truncate mr-3">
                       <div className="text-xs text-slate-200 font-medium truncate">{c.message}</div>
                       <div className="text-[10px] text-slate-500 mt-0.5 flex items-center gap-2">
-                        <span className="font-mono text-cyan-400">{c.sha}</span>
-                        <span>by {c.author}</span>
+                        <span className="font-mono text-cyan-400">{c.sha.slice(0, 7)}</span>
+                        <span>by {c.author ?? (c as any).author_name ?? 'unlinked author'}</span>
                         {c.date && <span>• {c.date}</span>}
                       </div>
                     </div>
@@ -195,11 +196,12 @@ export const RepoBrowserDrawer: React.FC<RepoBrowserDrawerProps> = ({ isOpen, on
 
           {activeTab === 'prs' && (
             <div className="space-y-2">
+              {filteredPrs.length === 0 && <div className="text-xs text-slate-500">No pull requests match.</div>}
               {filteredPrs.map((pr, idx) => {
                 const prUrl = pr.pr_url || `${repoUrl}/pull/${pr.id}`;
                 return (
                   <div
-                    key={idx}
+                    key={`${pr.id}-${idx}`}
                     className="p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 hover:border-slate-700 flex items-center justify-between transition-colors"
                   >
                     <div className="truncate mr-3">
@@ -208,8 +210,8 @@ export const RepoBrowserDrawer: React.FC<RepoBrowserDrawerProps> = ({ isOpen, on
                         <span>{pr.title}</span>
                       </div>
                       <div className="text-[10px] text-slate-500 mt-0.5 flex items-center gap-2">
-                        <span>by {pr.author}</span>
-                        <span className="px-1.5 py-0.2 rounded bg-purple-950/60 text-purple-300 border border-purple-500/30 uppercase text-[9px]">
+                        <span>by {pr.author ?? 'unknown'}</span>
+                        <span className="px-1.5 py-0.5 rounded bg-purple-950/60 text-purple-300 border border-purple-500/30 uppercase text-[9px]">
                           {pr.state}
                         </span>
                       </div>
@@ -234,7 +236,7 @@ export const RepoBrowserDrawer: React.FC<RepoBrowserDrawerProps> = ({ isOpen, on
 
         {/* Footer */}
         <div className="p-3 border-t border-slate-800/80 bg-slate-950 flex items-center justify-between text-xs text-slate-400">
-          <span>Live repository reference via GitHub REST API</span>
+          <span>Live repository data via GitHub REST API</span>
           <a
             href={repoUrl}
             target="_blank"

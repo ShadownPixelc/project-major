@@ -1,5 +1,5 @@
 import React from 'react';
-import { Sliders, Layers, FileCode, Users, GitFork } from 'lucide-react';
+import { Sliders } from 'lucide-react';
 
 interface DepthSliderProps {
   depth: number;
@@ -7,15 +7,15 @@ interface DepthSliderProps {
   disabled?: boolean;
 }
 
-export const DepthSlider: React.FC<DepthSliderProps> = ({ depth, onChangeDepth, disabled }) => {
-  const depthLabels: Record<number, { title: string; desc: string }> = {
-    1: { title: 'Core Backbone', desc: 'Core contributors & primary co-editing backbone' },
-    2: { title: 'Contributor Network', desc: 'All active contributors & review interactions' },
-    3: { title: 'Repository Files', desc: 'Contributors + connected code modules & file tablets' },
-    4: { title: 'AST Functions', desc: 'Tree-sitter parsed function entities & direct ownership' },
-    5: { title: 'Full Granular Codebase', desc: 'Complete AST nodes, files, and commit histories' },
-  };
+const depthLabels: Record<number, { title: string; desc: string }> = {
+  1: { title: 'Core Backbone', desc: 'Most active contributors & the links between them' },
+  2: { title: 'Contributor Network', desc: 'All contributors: co-edits, PR reviews & shared function ownership' },
+  3: { title: 'Repository Files', desc: 'Contributors + the most active files and who edits them' },
+  4: { title: 'AST Functions', desc: 'Tree-sitter functions (most complex first) linked to their owners' },
+  5: { title: 'Full Granular Codebase', desc: 'All files, all AST functions and file→function containment' },
+};
 
+export const DepthSlider: React.FC<DepthSliderProps> = ({ depth, onChangeDepth, disabled }) => {
   return (
     <div className="flex items-center gap-3 px-3.5 py-2 rounded-xl bg-slate-900/80 border border-slate-800 backdrop-blur-md shadow-lg text-xs">
       <div className="flex items-center gap-1.5 text-cyan-400 font-medium shrink-0">
@@ -32,7 +32,8 @@ export const DepthSlider: React.FC<DepthSliderProps> = ({ depth, onChangeDepth, 
           value={depth}
           disabled={disabled}
           onChange={(e) => onChangeDepth(Number(e.target.value))}
-          className="w-24 sm:w-32 h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+          className="w-24 sm:w-32 h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400 disabled:opacity-50 disabled:cursor-wait"
+          aria-label="Graph depth"
         />
         <div className="px-2 py-0.5 rounded bg-cyan-950/60 border border-cyan-500/30 text-cyan-300 font-mono font-bold text-xs shrink-0">
           L{depth}

@@ -1,31 +1,28 @@
 import React, { useState } from 'react';
-import { GitBranch, Terminal, Cpu, Database, Network, Search, ArrowRight, ShieldCheck, Sparkles, ExternalLink } from 'lucide-react';
+import { Cpu, Database, Network, ArrowRight, ShieldCheck, Sparkles, ExternalLink } from 'lucide-react';
 
 interface RepoIngestionProps {
   onAnalyze: (repoUrl: string) => void;
   isLoading: boolean;
 }
 
+const sampleRepos = [
+  { label: 'pallets/flask', desc: 'Python web microframework' },
+  { label: 'tiangolo/fastapi', desc: 'FastAPI' },
+  { label: 'networkx/networkx', desc: 'Python graph library' },
+  { label: 'expressjs/express', desc: 'Node web framework' },
+];
+
 export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoading }) => {
   const [inputVal, setInputVal] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputVal.trim() && !isLoading) {
-      onAnalyze('equinox-core');
-      return;
-    }
+    if (!inputVal.trim()) return;
     if (!isLoading) {
       onAnalyze(inputVal.trim());
     }
   };
-
-  const sampleRepos = [
-    { label: 'equinox-core', desc: 'Default Benchmark (12 Contributors)' },
-    { label: 'fastapi/tiangolo', desc: 'FastAPI Python Service' },
-    { label: 'pallets/flask', desc: 'Python Web Microframework' },
-    { label: 'networkx/networkx', desc: 'Python Graph Library' },
-  ];
 
   return (
     <div className="relative min-h-screen bg-[#07070b] text-slate-100 flex flex-col justify-center items-center px-4 overflow-hidden">
@@ -39,25 +36,25 @@ export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoadi
         <span>Equinox Contributor Graph &amp; RAG Visualizer</span>
       </div>
 
-      {/* Center Hero Heading - Matched to Image 1 */}
+      {/* Hero Heading */}
       <div className="max-w-3xl text-center mb-8 px-4">
         <h1 className="text-2xl sm:text-3xl md:text-4xl font-normal tracking-tight text-slate-100 leading-snug">
           Understand repositories faster with context-aware AI. Go from URL to architecture, code review, and security triage.
         </h1>
       </div>
 
-      {/* Center Input Form - Matched to Image 1 glow and styling */}
+      {/* Input Form */}
       <form onSubmit={handleSubmit} className="w-full max-w-2xl px-4 relative z-10">
         <div className="relative group">
           {/* Gradient glow border container */}
           <div className="absolute -inset-0.5 rounded-xl bg-gradient-to-r from-purple-500/50 via-fuchsia-500/40 to-cyan-500/50 opacity-75 group-hover:opacity-100 group-focus-within:opacity-100 blur-sm transition duration-300" />
-          
+
           <div className="relative flex items-center bg-[#0d0d14] rounded-xl border border-purple-500/40 focus-within:border-cyan-400/80 transition-all duration-200 shadow-2xl">
             <input
               type="text"
               value={inputVal}
               onChange={(e) => setInputVal(e.target.value)}
-              placeholder="GitHub URL, username, or repo"
+              placeholder="owner/repo or GitHub URL"
               disabled={isLoading}
               className="w-full px-5 py-4 bg-transparent text-slate-100 placeholder-slate-500 text-base md:text-lg focus:outline-none font-normal"
             />
@@ -80,7 +77,7 @@ export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoadi
 
             <button
               type="submit"
-              disabled={isLoading}
+              disabled={isLoading || !inputVal.trim()}
               className="mr-3 px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 via-fuchsia-600 to-cyan-600 hover:from-purple-500 hover:to-cyan-500 text-white font-medium text-sm transition-all duration-200 flex items-center gap-2 cursor-pointer shadow-lg disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
             >
               {isLoading ? (
@@ -102,10 +99,7 @@ export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoadi
         <div className="mt-5 flex flex-wrap items-center justify-center gap-2.5 text-xs text-slate-400">
           <span className="text-slate-500">Quick launch:</span>
           {sampleRepos.map((r) => {
-            const externalUrl =
-              r.label === 'equinox-core'
-                ? 'https://github.com/torvalds/linux'
-                : `https://github.com/${r.label}`;
+            const externalUrl = `https://github.com/${r.label}`;
 
             return (
               <div
@@ -119,8 +113,8 @@ export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoadi
                     onAnalyze(r.label);
                   }}
                   disabled={isLoading}
-                  className="px-2.5 py-1 hover:bg-slate-800/80 hover:text-slate-200 transition-colors text-slate-300 cursor-pointer"
-                  title={`Analyze ${r.label}`}
+                  className="px-2.5 py-1 hover:bg-slate-800/80 hover:text-slate-200 transition-colors text-slate-300 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={`Analyze ${r.label} — ${r.desc}`}
                 >
                   {r.label}
                 </button>
@@ -147,7 +141,7 @@ export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoadi
           </div>
           <h2 className="text-sm font-semibold text-slate-200">NetworkX Engine</h2>
           <p className="text-xs text-slate-400 mt-1">
-            Bipartite projection, degree centrality, and Louvain modularity clustering.
+            Co-edit, review and blame-based collaboration graph with centrality and community detection.
           </p>
         </div>
 
@@ -165,9 +159,9 @@ export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoadi
           <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400 mb-2.5">
             <Database className="w-4 h-4" />
           </div>
-          <h2 className="text-sm font-semibold text-slate-200">ChromaDB RAG</h2>
+          <h2 className="text-sm font-semibold text-slate-200">Grounded RAG</h2>
           <p className="text-xs text-slate-400 mt-1">
-            Vector semantic retrieval over commits, PRs, and functions with verified citations.
+            Retrieval over commits, PRs, files and functions, with citations that link to GitHub.
           </p>
         </div>
 
@@ -177,7 +171,7 @@ export const RepoIngestion: React.FC<RepoIngestionProps> = ({ onAnalyze, isLoadi
           </div>
           <h2 className="text-sm font-semibold text-slate-200">XAI Explanations</h2>
           <p className="text-xs text-slate-400 mt-1">
-            2-line instant summaries of contributor ownership and onboarding action outcomes.
+            2-line summaries of contributor ownership, reviews and risk, built from repository evidence.
           </p>
         </div>
       </div>

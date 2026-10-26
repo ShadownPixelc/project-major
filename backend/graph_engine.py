@@ -1,317 +1,224 @@
+"""Equinox - NetworkX collaboration graph + depth views.
 
-from typing import Dict, List, Any, Tuple, Optional, Set
+All inputs come from real GitHub data (file edit history, PR reviews, git blame).
+Nothing is synthesized here.
+"""
+
 import math
-import json
+from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    import networkx as nx
-    HAS_NETWORKX = True
-except ImportError:
-    HAS_NETWORKX = False
+import networkx as nx
+
+PALETTE = ["#00e5ff", "#ff1744", "#ffd600", "#00e676", "#2979ff", "#d500f9", "#ff9100", "#00b0ff"]
+W_CO_EDIT, W_REVIEW, W_FUNC = 1.0, 2.0, 1.5
+
+
+def _pair(a: str, b: str) -> Tuple[str, str]:
+    return (a, b) if a < b else (b, a)
+
+
+def _blank() -> Dict[str, Any]:
+    return {"files": set(), "co_edits": 0.0, "reviews": 0, "func": 0}
 
 
 class ContributorGraphEngine:
-    def __init__(self):
-        if HAS_NETWORKX:
-            self.graph = nx.Graph()
-            self.di_graph = nx.DiGraph()
-        else:
-            self.graph = None
-            self.di_graph = None
-
-    def build_bipartite_graph(
+    def build_collaboration_graph(
         self,
         contributors: List[Dict[str, Any]],
-        files: List[Dict[str, Any]],
-        ownership_matrix: List[Dict[str, Any]]
+        file_stats: Dict[str, Dict[str, int]],      # path -> {login: commits}
+        reviews: List[Dict[str, Any]],              # {author, reviewer, pr}
+        functions: List[Dict[str, Any]],            # with ownership_breakdown
     ) -> Dict[str, Any]:
+        ids = [c["id"] for c in contributors]
+        known = set(ids)
+        pairs: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        # 1) Co-editing: two people committed to the same file in the sampled history.
+        for path, by in file_stats.items():
+            people = [p for p in by if p in known]
+            for i in range(len(people)):
+                for j in range(i + 1, len(people)):
+                    d = pairs.setdefault(_pair(people[i], people[j]), _blank())
+                    d["files"].add(path)
+                    d["co_edits"] += min(by[people[i]], by[people[j]])
+
+        # 2) PR review interactions.
+        for r in reviews:
+            a, b = r.get("author"), r.get("reviewer")
+            if a in known and b in known and a != b:
+                pairs.setdefault(_pair(a, b), _blank())["reviews"] += 1
+
+        # 3) Function-level co-ownership from real blame (>=20% of a function's lines each).
+        for fn in functions:
+            if fn.get("ownership_basis") != "blame":
+                continue
+            owners = [o["contributor"] for o in fn.get("ownership_breakdown", [])
+                      if o["pct"] >= 20 and o["contributor"] in known]
+            for i in range(len(owners)):
+                for j in range(i + 1, len(owners)):
+                    pairs.setdefault(_pair(owners[i], owners[j]), _blank())["func"] += 1
+
+        raw = {k: d["co_edits"] * W_CO_EDIT + d["reviews"] * W_REVIEW + d["func"] * W_FUNC for k, d in pairs.items()}
+        raw = {k: v for k, v in raw.items() if v > 0}
+        max_raw = max(raw.values()) if raw else 1.0
+
+        G = nx.Graph()
+        G.add_nodes_from(ids)
+        for (a, b), w in raw.items():
+            G.add_edge(a, b, weight=w, distance=1.0 / w)  # strong tie => short path
+
+        n = len(ids)
+        deg = nx.degree_centrality(G) if n > 1 else {i: 0.0 for i in ids}
+        btw = nx.betweenness_centrality(G, weight="distance") if n > 2 else {i: 0.0 for i in ids}
+        try:
+            pr = nx.pagerank(G, weight="weight") if n else {}
+        except nx.PowerIterationFailedConvergence:
+            pr = {i: 1.0 / max(1, n) for i in ids}
+        community: Dict[str, int] = {i: 0 for i in ids}
+        if G.number_of_edges() > 0:
+            try:
+                comms = sorted(nx.community.greedy_modularity_communities(G, weight="weight"), key=len, reverse=True)
+                community = {m: idx for idx, c in enumerate(comms) for m in c}
+            except Exception:
+                pass
+
+        risk_info = self._bus_factor(ids, file_stats)
+
         nodes = []
-        edges = []
-
-        # Add Contributor nodes
-        for c in contributors:
-            c_name = c.get("name") or c.get("login") or c["id"]
-            nodes.append({
-                "id": c["id"],
-                "name": c_name,
-                "label": c_name,
-                "type": "contributor",
-                "badge": c.get("badge", "DEV"),
-                "color": c.get("color", "#00e5ff"),
-                "avatar_url": c.get("avatar_url", ""),
-                "commits_count": c.get("commits_count", 0),
-                "prs_reviewed": c.get("prs_reviewed", 0)
-            })
-
-        # Add File nodes
-        for f in files:
-            nodes.append({
-                "id": f["path"],
-                "type": "file",
-                "label": f["path"].split("/")[-1],
-                "full_path": f["path"],
-                "language": f.get("language", "Python"),
-                "lines": f.get("lines", 100),
-                "color": "#64748b"
-            })
-
-        # Add Edges
-        for link in ownership_matrix:
-            edges.append({
-                "source": link["contributor_id"],
-                "target": link["file_path"],
-                "weight": link.get("commit_count", 1),
-                "type": "authored",
-                "color": "#ffd600"
-            })
-
-        return {"nodes": nodes, "edges": edges}
-
-    def project_contributor_network(
-        self,
-        contributors: List[Dict[str, Any]],
-        ownership_matrix: List[Dict[str, Any]],
-        pr_reviews: Optional[List[Dict[str, Any]]] = None,
-        function_co_edits: Optional[List[Dict[str, Any]]] = None
-    ) -> Dict[str, Any]:
-        pr_reviews = pr_reviews or []
-        function_co_edits = function_co_edits or []
-
-        # Group file edits by file
-        file_to_contribs: Dict[str, Dict[str, int]] = {}
-        for row in ownership_matrix:
-            f = row["file_path"]
-            c = row["contributor_id"]
-            cnt = row.get("commit_count", 1) + row.get("lines_added", 10) // 50
-            if f not in file_to_contribs:
-                file_to_contribs[f] = {}
-            file_to_contribs[f][c] = file_to_contribs[f].get(c, 0) + cnt
-
-        # Compute pair co-edit edge weights
-        pair_weights: Dict[Tuple[str, str], Dict[str, Any]] = {}
-
-        for f, contribs in file_to_contribs.items():
-            c_list = list(contribs.keys())
-            for i in range(len(c_list)):
-                for j in range(i + 1, len(c_list)):
-                    c1, c2 = sorted([c_list[i], c_list[j]])
-                    weight = min(contribs[c1], contribs[c2])
-                    if (c1, c2) not in pair_weights:
-                        pair_weights[(c1, c2)] = {
-                            "shared_files": [],
-                            "weight": 0,
-                            "co_edits": 0,
-                            "pr_reviews": 0,
-                            "function_co_ownership": 0
-                        }
-                    pair_weights[(c1, c2)]["shared_files"].append(f.split("/")[-1])
-                    pair_weights[(c1, c2)]["co_edits"] += weight
-                    pair_weights[(c1, c2)]["weight"] += weight * 1.5
-
-        # Incorporate PR review interactions
-        for pr in pr_reviews:
-            author = pr.get("author")
-            reviewer = pr.get("reviewer")
-            if author and reviewer and author != reviewer:
-                c1, c2 = sorted([author, reviewer])
-                if (c1, c2) not in pair_weights:
-                    pair_weights[(c1, c2)] = {
-                        "shared_files": [],
-                        "weight": 0,
-                        "co_edits": 0,
-                        "pr_reviews": 0,
-                        "function_co_ownership": 0
-                    }
-                pair_weights[(c1, c2)]["pr_reviews"] += 1
-                pair_weights[(c1, c2)]["weight"] += 2.5
-
-        # Incorporate Tree-sitter function-level co-ownership
-        for fco in function_co_edits:
-            c1, c2 = sorted([fco["author_a"], fco["author_b"]])
-            if (c1, c2) not in pair_weights:
-                pair_weights[(c1, c2)] = {
-                    "shared_files": [],
-                    "weight": 0,
-                    "co_edits": 0,
-                    "pr_reviews": 0,
-                    "function_co_ownership": 0
-                }
-            pair_weights[(c1, c2)]["function_co_ownership"] += 1
-            pair_weights[(c1, c2)]["weight"] += 3.0
-
-        # Construct NetworkX graph if available
-        if HAS_NETWORKX:
-            G = nx.Graph()
-            for c in contributors:
-                G.add_node(c["id"], **c)
-            for (c1, c2), data in pair_weights.items():
-                G.add_edge(c1, c2, weight=data["weight"], **data)
-
-            # Centrality metrics
-            deg_centrality = nx.degree_centrality(G)
-            between_centrality = nx.betweenness_centrality(G, weight="weight")
-            try:
-                pagerank = nx.pagerank(G, weight="weight")
-            except Exception:
-                pagerank = {c["id"]: 1.0 / max(1, len(contributors)) for c in contributors}
-            try:
-                # Modularity communities
-                communities = list(nx.community.greedy_modularity_communities(G))
-                community_map = {}
-                for idx, comm in enumerate(communities):
-                    for member in comm:
-                        community_map[member] = idx
-            except Exception:
-                community_map = {c["id"]: 0 for c in contributors}
-        else:
-            deg_centrality, between_centrality, pagerank, community_map = self._pure_python_metrics(
-                contributors, pair_weights
-            )
-
-        edges = []
-        for (c1, c2), data in pair_weights.items():
-            w = data["weight"]
-            color = "#ff1744" if w > 5 else ("#ffd600" if data["pr_reviews"] > 0 else "#00e5ff")
-            edges.append({
-                "source": c1,
-                "target": c2,
-                "weight": round(w, 2),
-                "co_edits": data["co_edits"],
-                "pr_reviews": data["pr_reviews"],
-                "function_co_ownership": data["function_co_ownership"],
-                "shared_files": data["shared_files"][:4],
-                "color": color,
-                "glow": w > 4
-            })
-
-        # Enrich contributors with metrics
-        enriched_contributors = []
         for c in contributors:
             cid = c["id"]
-            c_name = c.get("name") or c.get("login") or cid
-            enriched_contributors.append({
-                **c,
-                "type": "contributor",
-                "name": c_name,
-                "label": c_name,
-                "degree_centrality": round(deg_centrality.get(cid, 0.0), 3),
-                "betweenness_centrality": round(between_centrality.get(cid, 0.0), 3),
-                "pagerank": round(pagerank.get(cid, 0.0), 3),
-                "community_cluster": community_map.get(cid, 0),
-                "bus_factor_risk": "HIGH" if between_centrality.get(cid, 0) > 0.4 else ("MEDIUM" if between_centrality.get(cid, 0) > 0.2 else "LOW")
+            ri = risk_info[cid]
+            nodes.append({
+                **c, "type": "contributor", "label": c.get("name") or cid,
+                "degree_centrality": round(deg.get(cid, 0.0), 3),
+                "betweenness_centrality": round(btw.get(cid, 0.0), 3),
+                "pagerank": round(pr.get(cid, 0.0), 3),
+                "community_cluster": community.get(cid, 0),
+                "color": PALETTE[community.get(cid, 0) % len(PALETTE)],
+                **ri,
             })
 
-        return {
-            "nodes": enriched_contributors,
-            "edges": edges,
-            "network_stats": {
-                "total_contributors": len(contributors),
-                "total_collaborations": len(edges),
-                "graph_density": round(2 * len(edges) / max(1, len(contributors) * (len(contributors) - 1)), 3),
-                "has_networkx": HAS_NETWORKX
-            }
-        }
+        edges = []
+        for (a, b), w in sorted(raw.items(), key=lambda kv: -kv[1]):
+            d = pairs[(a, b)]
+            nw = round(10.0 * w / max_raw, 2)
+            color = "#ff1744" if nw >= 6.5 else ("#ffd600" if d["reviews"] > 0 else "#00e5ff")
+            edges.append({
+                "source": a, "target": b, "weight": nw, "raw_weight": round(w, 2), "type": "collaboration",
+                "co_edits": int(d["co_edits"]), "pr_reviews": d["reviews"], "function_co_ownership": d["func"],
+                "shared_files": sorted(d["files"])[:4], "shared_files_count": len(d["files"]),
+                "color": color, "glow": nw >= 4,
+            })
 
-    def filter_by_depth(self, full_graph: Dict[str, Any], depth_level: int) -> Dict[str, Any]:
+        counts = sorted((c.get("window_commits", 0) for c in contributors), reverse=True)
+        total = sum(counts)
+        truck, acc = 0, 0
+        for v in counts:
+            if total == 0:
+                break
+            acc += v
+            truck += 1
+            if acc >= total / 2:
+                break
 
-        nodes = full_graph.get("nodes", [])
-        edges = full_graph.get("edges", [])
+        return {"nodes": nodes, "edges": edges, "network_stats": {
+            "total_contributors": n, "total_collaborations": len(edges),
+            "graph_density": round(nx.density(G), 3) if n > 1 else 0.0, "has_networkx": True,
+            "communities": len(set(community.values())) if n else 0, "bus_factor": truck or None}}
 
-        if depth_level <= 1:
-            # Low depth: only core contributors and top edges
-            filtered_edges = [e for e in edges if e.get("weight", 0) >= 3.0]
-            connected_node_ids = set()
-            for e in filtered_edges:
-                connected_node_ids.add(e["source"])
-                connected_node_ids.add(e["target"])
-            filtered_nodes = [n for n in nodes if n["id"] in connected_node_ids or n.get("degree_centrality", 0) > 0.3]
-            if len(filtered_nodes) < 3:
-                filtered_nodes = sorted(nodes, key=lambda x: x.get("commits_count", 0), reverse=True)[:5]
-                kept_ids = {n["id"] for n in filtered_nodes}
-                filtered_edges = [e for e in edges if e["source"] in kept_ids and e["target"] in kept_ids]
-            return {"nodes": filtered_nodes, "edges": filtered_edges, "depth": depth_level}
+    @staticmethod
+    def _bus_factor(ids: List[str], file_stats: Dict[str, Dict[str, int]]) -> Dict[str, Dict[str, Any]]:
+        """A contributor is a risk when they are the dominant (>=80%) author of many actively edited files."""
+        active = {p: by for p, by in file_stats.items() if sum(by.values()) >= 2}
+        dominated = {i: 0 for i in ids}
+        for by in active.values():
+            tot = sum(by.values())
+            top = max(by, key=by.get)
+            if top in dominated and by[top] / tot >= 0.8:
+                dominated[top] += 1
+        out = {}
+        for i in ids:
+            n, ratio = dominated[i], dominated[i] / max(1, len(active))
+            risk = "HIGH" if (ratio >= 0.25 and n >= 3) else ("MEDIUM" if (ratio >= 0.10 and n >= 2) else "LOW")
+            out[i] = {"bus_factor_risk": risk, "exclusive_files": n, "exclusive_files_pct": round(100 * ratio, 1)}
+        return out
 
-        elif depth_level == 2:
-            # All contributors and significant edges
-            filtered_edges = [e for e in edges if e.get("weight", 0) >= 1.5]
-            return {"nodes": nodes, "edges": filtered_edges, "depth": depth_level}
 
-        # For depth 3+, caller or graph engine integrates file/AST nodes
-        return {"nodes": nodes, "edges": edges, "depth": depth_level}
+# ------------------------------------------------------------------ depth views
+def fn_node_id(fn: Dict[str, Any]) -> str:
+    return f"fn:{fn['file_path']}#{fn['name']}:{fn['start_line']}"
 
-    def _pure_python_metrics(
-        self,
-        contributors: List[Dict[str, Any]],
-        pair_weights: Dict[Tuple[str, str], Dict[str, Any]]
-    ) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, int]]:
-        """Fallback graph metric calculation without NetworkX dependency."""
-        n = len(contributors)
-        c_ids = [c["id"] for c in contributors]
-        adj: Dict[str, Set[str]] = {cid: set() for cid in c_ids}
-        adj_weighted: Dict[str, Dict[str, float]] = {cid: {} for cid in c_ids}
 
-        for (u, v), data in pair_weights.items():
-            w = data.get("weight", 1.0)
-            if u in adj and v in adj:
-                adj[u].add(v)
-                adj[v].add(u)
-                adj_weighted[u][v] = w
-                adj_weighted[v][u] = w
+def file_node_id(path: str) -> str:
+    return f"file:{path}"
 
-        deg = {cid: len(adj[cid]) / max(1, n - 1) for cid in c_ids}
 
-        # Simplified betweenness (shortest paths via BFS)
-        betweenness = {cid: 0.0 for cid in c_ids}
-        for s in c_ids:
-            for t in c_ids:
-                if s == t:
-                    continue
-                # BFS shortest path
-                queue = [[s]]
-                visited = {s}
-                found_paths = []
-                while queue:
-                    path = queue.pop(0)
-                    curr = path[-1]
-                    if curr == t:
-                        found_paths.append(path)
-                        continue
-                    for nbr in adj[curr]:
-                        if nbr not in visited or nbr == t:
-                            queue.append(path + [nbr])
-                            visited.add(nbr)
-                if found_paths:
-                    for p in found_paths:
-                        for inter in p[1:-1]:
-                            betweenness[inter] += 1.0 / len(found_paths)
+def build_view(state: Dict[str, Any], depth: int) -> Dict[str, Any]:
+    """Depth 1 backbone -> 2 all contributors -> 3 + files -> 4 + AST functions -> 5 everything + containment."""
+    contributors = state["contributors"]
+    edges = state["edges"]
+    ids = {c["id"] for c in contributors}
 
-        max_b = max(list(betweenness.values()) + [1.0])
-        betweenness = {k: v / max_b for k, v in betweenness.items()}
+    if depth <= 1:
+        k = max(3, min(8, round(len(contributors) * 0.4)))
+        top = sorted(contributors, key=lambda c: (c.get("commits_count", 0), c.get("prs_reviewed", 0)), reverse=True)[:k]
+        keep = {c["id"] for c in top}
+        nodes = [c for c in contributors if c["id"] in keep]
+        out_edges = [e for e in edges if e["source"] in keep and e["target"] in keep]
+    else:
+        nodes = list(contributors)
+        out_edges = list(edges[:200])
 
-        # PageRank iterative
-        pr = {cid: 1.0 / max(1, n) for cid in c_ids}
-        for _ in range(20):
-            next_pr = {}
-            for cid in c_ids:
-                rank_sum = sum(pr[nbr] / max(1, len(adj[nbr])) for nbr in adj[cid])
-                next_pr[cid] = 0.15 / n + 0.85 * rank_sum
-            pr = next_pr
+    nodes = [dict(n) for n in nodes]
+    out_edges = [dict(e) for e in out_edges]
 
-        # Community clustering by adjacency
-        communities = {}
-        curr_comm = 0
-        visited = set()
-        for cid in c_ids:
-            if cid not in visited:
-                q = [cid]
-                visited.add(cid)
-                while q:
-                    curr = q.pop(0)
-                    communities[curr] = curr_comm
-                    for nbr in adj[curr]:
-                        if nbr not in visited:
-                            visited.add(nbr)
-                            q.append(nbr)
-                curr_comm += 1
+    files = sorted(state["files"], key=lambda f: (f.get("commits", 0), f.get("parsed", False)), reverse=True)
+    functions = state["ast_functions"]
+    head = state.get("head_sha") or state.get("default_branch", "HEAD")
+    repo_url = state["repo_url"]
 
-        return deg, betweenness, pr, communities
+    file_ids = set()
+    if depth >= 3:
+        cap = 60 if depth >= 5 else 30
+        chosen = [f for f in files if f.get("commits", 0) > 0 or f.get("parsed")][:cap]
+        if depth >= 5:  # make sure every file that owns a function is present
+            have = {f["path"] for f in chosen}
+            chosen += [f for f in files if f.get("parsed") and f["path"] not in have]
+        for f in chosen:
+            fid = file_node_id(f["path"])
+            file_ids.add(fid)
+            nodes.append({"id": fid, "type": "file", "label": f["path"].split("/")[-1], "full_path": f["path"],
+                          "language": f.get("language"), "lines": f.get("lines"), "color": "#64748b",
+                          "file_url": f.get("file_url") or f"{repo_url}/blob/{head}/{f['path']}",
+                          "commits": f.get("commits", 0)})
+            by = f.get("contributor_commits", {})
+            tot = sum(by.values()) or 1
+            for login, n in sorted(by.items(), key=lambda kv: -kv[1])[:3]:
+                if login in ids:
+                    out_edges.append({"source": login, "target": fid, "type": "authored_file", "color": "#475569",
+                                      "weight": round(1 + 4 * n / tot, 2), "commits": n})
+
+    if depth >= 4:
+        ranked = sorted(functions, key=lambda f: (f.get("cyclomatic_complexity", 1)), reverse=True)
+        chosen_fns = ranked[:150] if depth >= 5 else ranked[:40]
+        for fn in chosen_fns:
+            fid = fn_node_id(fn)
+            short = fn["name"].split(".")[-1]
+            nodes.append({"id": fid, "type": "ast_function", "label": f"{short}()", "name": fn["name"],
+                          "file_path": fn["file_path"], "complexity": fn.get("cyclomatic_complexity", 1),
+                          "color": "#a855f7", "github_url": fn.get("github_url"),
+                          "owner": fn.get("primary_owner"), "ownership_pct": fn.get("primary_ownership_pct"),
+                          "ownership_basis": fn.get("ownership_basis")})
+            for o in (fn.get("ownership_breakdown") or [])[:2]:
+                if o["contributor"] in ids and (o is fn["ownership_breakdown"][0] or o["pct"] >= 25):
+                    out_edges.append({"source": o["contributor"], "target": fid, "type": "owns_ast_function",
+                                      "color": "#00e5ff", "weight": round(max(1.0, o["pct"] / 20), 2)})
+            if depth >= 5:
+                parent = file_node_id(fn["file_path"])
+                if parent in file_ids:
+                    out_edges.append({"source": parent, "target": fid, "type": "contains", "color": "#6b21a8",
+                                      "weight": 1.5})
+
+    node_ids = {n["id"] for n in nodes}
+    out_edges = [e for e in out_edges if e["source"] in node_ids and e["target"] in node_ids]
+    return {"nodes": nodes, "edges": out_edges}

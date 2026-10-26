@@ -1,252 +1,180 @@
+"""Equinox - citation-grounded RAG over the analysed repository.
 
-from typing import Dict, List, Any, Optional, Tuple
+Primary retriever: TF-IDF cosine (deterministic, no model download).
+Optional: ChromaDB (persistent, one collection per repo snapshot). If Chroma is
+missing, disabled, or fails (e.g. embedding model cannot be downloaded) retrieval
+silently falls back to TF-IDF. Irrelevant documents are never returned.
+"""
+
+import hashlib
 import math
 import re
-import json
+from collections import Counter
+from typing import Any, Dict, List, Optional
 
-try:
-    import chromadb
-    from chromadb.config import Settings
-    HAS_CHROMADB = True
-except ImportError:
-    HAS_CHROMADB = False
+from backend import config
+from backend.xai import contributor_profile, build_summary
+
+_STOP = {"the", "a", "an", "in", "on", "of", "to", "for", "and", "or", "is", "was", "it", "with", "by", "this",
+         "that", "what", "who", "how", "do", "i", "me", "my", "does", "are", "be", "about", "should"}
+
+
+def tokenize(text: str) -> List[str]:
+    out: List[str] = []
+    for w in re.findall(r"[A-Za-z0-9_./#-]+", text):
+        spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", w)
+        parts = [p.lower() for p in re.findall(r"[A-Za-z]+|\d+", spaced)]
+        full = w.lower().strip("._-/#")
+        out += parts
+        if full and full not in parts:
+            out.append(full)
+    return [t for t in out if len(t) > 1 and t not in _STOP]
 
 
 class RAGPipeline:
-    
-    def __init__(self, collection_name: str = "equinox_repo_knowledge"):
-        self.collection_name = collection_name
+    def __init__(self, repo_key: str, persist_dir=None):
+        self.repo_key = repo_key
         self.documents: List[Dict[str, Any]] = []
-        self.vocabulary: Dict[str, int] = {}
-        self.idf: Dict[str, float] = {}
+        self.retriever = "tfidf"
+        self.chroma_error: Optional[str] = None
+        self._idf: Dict[str, float] = {}
+        self._vecs: List[Dict[str, float]] = []
+        self._collection = None
+        self._persist_dir = persist_dir or (config.cache_dir() / "chroma")
 
-        if HAS_CHROMADB:
+    # ---------------------------------------------------------------- ingestion
+    def ingest(self, state: Dict[str, Any]) -> "RAGPipeline":
+        url = state["repo_url"]
+        head = state.get("head_sha") or state.get("default_branch")
+        docs: List[Dict[str, Any]] = []
+
+        for c in state["commits"]:
+            files = ", ".join(c.get("files", [])[:6])
+            docs.append({"id": f"commit_{c['sha']}", "type": "commit", "citation": f"[Commit #{c['short']}]",
+                         "text": f"Commit {c['short']} by {c.get('author') or c.get('author_name')} on {c['date']}: "
+                                 f"{c['message']}." + (f" Files: {files}." if files else ""),
+                         "people": [c["author"]] if c.get("author") else [], "url": c["url"]})
+        for p in state["prs"]:
+            people = [x for x in [p.get("author")] + p.get("reviewers", []) if x]
+            docs.append({"id": f"pr_{p['id']}", "type": "pull_request", "citation": f"[PR #{p['id']}]",
+                         "text": f"PR #{p['id']} ({p['state']}) by {p.get('author')}: {p['title']}. "
+                                 f"Reviewers: {', '.join(p.get('reviewers', [])) or 'none recorded'}. {p.get('body', '')}",
+                         "people": people, "url": p["pr_url"]})
+        for fn in state["ast_functions"]:
+            owners = ", ".join(f"{o['contributor']} {o['pct']:.0f}%" for o in fn.get("ownership_breakdown", [])) or "unknown"
+            basis = {"blame": "git blame", "file-commits": "file commit history"}.get(fn.get("ownership_basis"), "no ownership data")
+            docs.append({"id": f"ast_{fn['file_path']}_{fn['name']}_{fn['start_line']}", "type": "ast_function",
+                         "citation": f"[AST: {fn['name']}() in {fn['file_path']}:L{fn['start_line']}]",
+                         "text": f"Function {fn['name']} in {fn['file_path']} lines {fn['start_line']}-{fn['end_line']} "
+                                 f"({fn.get('language')}). Signature: {fn.get('signature', '')}. "
+                                 f"Owners ({basis}): {owners}. Cyclomatic complexity {fn.get('cyclomatic_complexity', 1)}.",
+                         "people": [o["contributor"] for o in fn.get("ownership_breakdown", [])],
+                         "url": fn.get("github_url")})
+        for f in state["files"]:
+            by = ", ".join(f"{k} ({v})" for k, v in sorted(f.get("contributor_commits", {}).items(), key=lambda kv: -kv[1])[:4])
+            docs.append({"id": f"file_{f['path']}", "type": "file", "citation": f"[File: {f['path']}]",
+                         "text": f"File {f['path']} ({f.get('language')}). "
+                                 + (f"Recent commits by: {by}." if by else "No commits in the sampled history."),
+                         "people": list(f.get("contributor_commits", {}).keys()), "url": f.get("file_url")})
+        for c in state["contributors"]:
             try:
-                self.client = chromadb.Client(Settings(anonymized_telemetry=False))
-                self.collection = self.client.get_or_create_collection(name=collection_name)
-            except Exception:
-                self.collection = None
-        else:
-            self.collection = None
+                prof = contributor_profile(state, c["id"])
+            except ValueError:
+                continue
+            docs.append({"id": f"contributor_{c['id']}", "type": "contributor", "citation": f"[Contributor: {c['id']}]",
+                         "text": f"Contributor {c['id']}. " + build_summary(prof).replace("\n", " "),
+                         "people": [c["id"]], "url": c.get("profile_url")})
+        self.documents = docs
+        self._build_tfidf()
+        return self
 
-    def ingest_knowledge_base(
-        self,
-        commits: List[Dict[str, Any]],
-        prs: List[Dict[str, Any]],
-        ast_functions: List[Dict[str, Any]],
-        files: List[Dict[str, Any]]
-    ):
-        """
-        Chunks and indexes repository evidence into the vector store.
-        """
-        docs_to_add = []
+    def _build_tfidf(self) -> None:
+        toks = [tokenize(d["text"] + " " + " ".join(d["people"])) for d in self.documents]
+        n = len(toks)
+        df = Counter(t for ts in toks for t in set(ts))
+        self._idf = {t: math.log((n + 1) / (c + 1)) + 1.0 for t, c in df.items()}
+        self._vecs = []
+        for ts in toks:
+            tf = Counter(ts)
+            v = {t: (1 + math.log(c)) * self._idf[t] for t, c in tf.items()}
+            norm = math.sqrt(sum(x * x for x in v.values())) or 1.0
+            self._vecs.append({t: x / norm for t, x in v.items()})
 
-        # Index Commits
-        for c in commits:
-            text = f"Commit {c['sha'][:7]} by {c['author']}: {c['message']}. Files modified: {', '.join(c.get('files', []))}"
-            docs_to_add.append({
-                "id": f"commit_{c['sha']}",
-                "text": text,
-                "type": "commit",
-                "citation": f"[Commit #{c['sha'][:7]}]",
-                "metadata": {
-                    "author": c["author"],
-                    "sha": c["sha"],
-                    "date": c.get("date", ""),
-                    "files": c.get("files", [])
-                }
-            })
-
-        # Index Pull Requests
-        for pr in prs:
-            reviewers = ", ".join(pr.get("reviewers", []))
-            text = f"PR #{pr['id']} ({pr.get('state', 'merged')}): {pr['title']}. Author: {pr['author']}, Reviewers: {reviewers}. Summary: {pr.get('body', '')}"
-            docs_to_add.append({
-                "id": f"pr_{pr['id']}",
-                "text": text,
-                "type": "pull_request",
-                "citation": f"[PR #{pr['id']}]",
-                "metadata": {
-                    "author": pr["author"],
-                    "reviewers": pr.get("reviewers", []),
-                    "pr_id": pr["id"]
-                }
-            })
-
-        # Index AST Function definitions
-        for fn in ast_functions:
-            text = (
-                f"Function {fn['name']} in file {fn['file_path']} (lines {fn['start_line']}-{fn['end_line']}). "
-                f"Primary Owner: {fn.get('primary_owner', 'Unassigned')} ({fn.get('primary_ownership_pct', 100)}%). "
-                f"Parameters: {', '.join(fn.get('parameters', []))}. "
-                f"Docstring: {fn.get('docstring_preview', '')}. Complexity: {fn.get('cyclomatic_complexity', 1)}"
-            )
-            docs_to_add.append({
-                "id": f"ast_{fn['file_path']}_{fn['name']}",
-                "text": text,
-                "type": "ast_function",
-                "citation": f"[AST: {fn['name']}() in {fn['file_path']}:L{fn['start_line']}]",
-                "metadata": {
-                    "function_name": fn["name"],
-                    "file_path": fn["file_path"],
-                    "owner": fn.get("primary_owner", "Unassigned"),
-                    "lines": f"{fn['start_line']}-{fn['end_line']}"
-                }
-            })
-
-        # Index Module Files
-        for f in files:
-            text = f"File {f['path']} ({f.get('language', 'Code')}). Primary contributors: {', '.join(f.get('contributors', []))}. Description: {f.get('summary', 'Source code file')}"
-            docs_to_add.append({
-                "id": f"file_{f['path']}",
-                "text": text,
-                "type": "file",
-                "citation": f"[File: {f['path']}]",
-                "metadata": {
-                    "file_path": f["path"],
-                    "language": f.get("language", "")
-                }
-            })
-
-        self.documents = docs_to_add
-
-        # If ChromaDB collection exists, add documents
-        if self.collection:
-            try:
-                ids = [d["id"] for d in docs_to_add]
-                texts = [d["text"] for d in docs_to_add]
-                metas = [{"type": d["type"], "citation": d["citation"], "author": d["metadata"].get("author", "")} for d in docs_to_add]
-                self.collection.add(ids=ids, documents=texts, metadatas=metas)
-            except Exception:
-                pass
-
-        # Compute internal TF-IDF vector index
-        self._build_tfidf_index()
-
-    def _tokenize(self, text: str) -> List[str]:
-        tokens = re.findall(r'[a-zA-Z0-9_\-\.#]+', text.lower())
-        stopwords = {"the", "a", "an", "in", "on", "of", "to", "for", "and", "or", "is", "was", "it", "with", "by", "this", "that"}
-        return [t for t in tokens if t not in stopwords and len(t) > 1]
-
-    def _build_tfidf_index(self):
-        doc_count = len(self.documents)
-        if doc_count == 0:
+    # ------------------------------------------------------------------ chroma
+    def _init_chroma(self, fingerprint: str) -> None:
+        mode = config.use_chroma()
+        if mode == "0" or not self.documents:
             return
+        try:
+            import chromadb  # lazy: slow import, only needed for RAG queries
 
-        df: Dict[str, int] = {}
-        for doc in self.documents:
-            tokens = set(self._tokenize(doc["text"]))
-            for t in tokens:
-                df[t] = df.get(t, 0) + 1
+            client = chromadb.PersistentClient(path=str(self._persist_dir))
+            name = "eq_" + hashlib.sha1(f"{self.repo_key}:{fingerprint}".encode()).hexdigest()[:24]
+            col = client.get_or_create_collection(name)
+            if col.count() != len(self.documents):
+                client.delete_collection(name)
+                col = client.create_collection(name)
+                col.add(ids=[d["id"] for d in self.documents], documents=[d["text"] for d in self.documents],
+                        metadatas=[{"type": d["type"], "citation": d["citation"]} for d in self.documents])
+            self._collection = col
+            self.retriever = "chroma"
+        except Exception as e:  # missing package, offline model download, etc.
+            self._collection, self.retriever, self.chroma_error = None, "tfidf", str(e)[:200]
 
-        self.idf = {t: math.log((doc_count + 1) / (freq + 1)) + 1.0 for t, freq in df.items()}
+    def enable_chroma(self, fingerprint: str) -> None:
+        self._init_chroma(fingerprint)
 
-    def retrieve(self, query: str, top_k: int = 5, filter_author: Optional[str] = None) -> List[Dict[str, Any]]:
+    # --------------------------------------------------------------- retrieval
+    def retrieve(self, query: str, top_k: int = 5, focus: Optional[str] = None) -> List[Dict[str, Any]]:
         if not self.documents:
             return []
+        focus_l = focus.lower() if focus else None
 
-        if self.collection:
+        def allowed(d):
+            return not focus_l or any(p.lower() == focus_l for p in d["people"])
+
+        if self._collection is not None:
             try:
-                where_filter = {"author": filter_author} if filter_author else None
-                res = self.collection.query(query_texts=[query], n_results=top_k, where=where_filter)
-                if res and res["ids"] and len(res["ids"][0]) > 0:
-                    matched_ids = set(res["ids"][0])
-                    return [d for d in self.documents if d["id"] in matched_ids][:top_k]
-            except Exception:
-                pass
+                res = self._collection.query(query_texts=[query], n_results=min(len(self.documents), top_k * 6))
+                by_id = {d["id"]: d for d in self.documents}
+                hits = [by_id[i] for i in (res.get("ids") or [[]])[0] if i in by_id and allowed(by_id[i])]
+                if hits:
+                    return hits[:top_k]
+            except Exception as e:
+                self._collection, self.retriever, self.chroma_error = None, "tfidf", str(e)[:200]
 
-        # Fallback TF-IDF cosine similarity search
-        query_tokens = self._tokenize(query)
-        q_weights: Dict[str, float] = {}
-        for t in query_tokens:
-            if t in self.idf:
-                q_weights[t] = q_weights.get(t, 0) + self.idf[t]
-
-        scores = []
-        for doc in self.documents:
-            if filter_author and doc["metadata"].get("author") and doc["metadata"].get("author") != filter_author:
+        q = Counter(tokenize(query))
+        qv = {t: (1 + math.log(c)) * self._idf[t] for t, c in q.items() if t in self._idf}
+        qn = math.sqrt(sum(x * x for x in qv.values()))
+        if not qv or qn == 0:
+            return []
+        scored = []
+        for d, v in zip(self.documents, self._vecs):
+            if not allowed(d):
                 continue
+            s = sum(w * v.get(t, 0.0) for t, w in qv.items()) / qn
+            if s > 0:
+                scored.append((s, d))
+        scored.sort(key=lambda x: -x[0])
+        return [d for _, d in scored[:top_k]]
 
-            doc_tokens = self._tokenize(doc["text"])
-            dot_product = 0.0
-            doc_norm = math.sqrt(len(doc_tokens)) or 1.0
+    # ----------------------------------------------------------------- prompts
+    def build_prompt(self, query: str, docs: List[Dict[str, Any]], focus: Optional[str] = None) -> str:
+        ctx = "\n".join(f"- {d['citation']} {d['text']}" for d in docs) or "(no evidence retrieved)"
+        focus_note = f"Focus on contributor '{focus}'.\n" if focus else ""
+        return (
+            "You are the Equinox onboarding assistant for a GitHub repository.\n"
+            "Answer ONLY from the evidence below. Cite every claim with its bracketed citation exactly as written.\n"
+            "If the evidence does not answer the question, say so plainly. Do not invent files, functions or people.\n"
+            "End with 1-3 concrete next steps (who to ask, which function/file to read).\n\n"
+            f"EVIDENCE:\n{ctx}\n\n{focus_note}QUESTION: {query}\n\nANSWER:\n")
 
-            for t in doc_tokens:
-                if t in q_weights:
-                    dot_product += q_weights[t] * self.idf.get(t, 1.0)
-
-            # Bonus for exact token matches in metadata
-            if filter_author and filter_author.lower() in doc["text"].lower():
-                dot_product += 2.0
-
-            sim = dot_product / doc_norm
-            scores.append((sim, doc))
-
-        scores.sort(key=lambda x: x[0], reverse=True)
-        return [doc for score, doc in scores[:top_k] if score > 0] or [d for _, d in scores[:top_k]]
-
-    def generate_xai_summary(
-        self,
-        contributor: Dict[str, Any],
-        top_functions: List[Dict[str, Any]],
-        repo_name: str = "equinox-core",
-        authored_files: Optional[List[str]] = None,
-        recent_commits: Optional[List[Dict[str, Any]]] = None
-    ) -> str:
-        """
-        XAI Feature: Generates a 2-line summary strictly matching the given repo and the contributor's actual work.
-        """
-        cid = contributor.get("name") or contributor.get("id", "Contributor")
-        role = contributor.get("role") or contributor.get("domain", "Core Contributor")
-        desc = contributor.get("key_contribution")
-        
-        owned_fns = [f["name"] for f in top_functions if f.get("primary_owner") == cid or f.get("primary_owner") == contributor.get("id")][:3]
-        files = authored_files or contributor.get("authored_files", [])
-        commits = recent_commits or contributor.get("recent_commits", [])
-
-        # Line 1: Explicitly describe their role and specific key contribution in the repository
-        if desc:
-            clean_desc = desc.strip().rstrip(".")
-            line1 = f"{cid} served as the {role} in {repo_name}, specifically: {clean_desc}."
-        else:
-            line1 = f"{cid} is an active core contributor to {repo_name}, leading {role}."
-
-        # Line 2: Architectural and code-level impact
-        if owned_fns and files:
-            file_names = [f.split('/')[-1] for f in files[:2]]
-            line2 = f"Their architectural impact centers on {', '.join([f'{f}()' for f in owned_fns])} across {', '.join(file_names)}, establishing the core functionality of {repo_name}."
-        elif owned_fns:
-            line2 = f"Their code establishes key functions ({', '.join([f'{f}()' for f in owned_fns])}), providing critical operational logic for {repo_name}."
-        elif files:
-            file_names = [f.split('/')[-1] for f in files[:3]]
-            line2 = f"They maintain foundational modules ({', '.join(file_names)}), ensuring system reliability and smooth code review lifecycles."
-        else:
-            commits_cnt = contributor.get("commits_count", 1)
-            prs_cnt = contributor.get("prs_reviewed", 0)
-            line2 = f"Across {commits_cnt} commits and {prs_cnt} peer reviews, their contributions maintain the primary stability and release readiness of {repo_name}."
-
-        return f"{line1}\n{line2}"
-
-    def build_rag_prompt(self, query: str, context_docs: List[Dict[str, Any]], contributor_focus: Optional[str] = None) -> str:
-        """
-        Formats retrieved repository evidence into a strict citation-grounded RAG prompt.
-        """
-        context_str = "\n".join([f"- {d['citation']} {d['text']}" for d in context_docs])
-        focus_note = f"Focus strictly on contributor '{contributor_focus}' and their connected modules." if contributor_focus else ""
-
-        prompt = f"""You are the Equinox RAG Onboarding Assistant for this software repository.
-Answer the user's question using ONLY the retrieved repository evidence below.
-You MUST cite your evidence using the provided citations such as [Commit #...], [AST: func() in file:line], or [PR #...].
-Suggest concrete developer onboarding next steps (e.g. what functions to modify, who to request reviews from).
-Do not hallucinate or reference packages outside the repository context.
-
-RETRIEVED REPOSITORY EVIDENCE:
-{context_str}
-
-USER QUERY:
-{query}
-{focus_note}
-
-GROUNDED EXPLANATION & SUGGESTED ACTION:
-"""
-        return prompt
+    @staticmethod
+    def extractive_answer(query: str, docs: List[Dict[str, Any]], focus: Optional[str] = None) -> str:
+        if not docs:
+            return "No evidence in the analysed history matches this question."
+        lines = [f"{d['citation']} {d['text']}" for d in docs]
+        people = Counter(p for d in docs for p in d["people"] if p and p != focus)
+        nxt = (f"Suggested next step: read the cited files/functions, then ask {people.most_common(1)[0][0]} "
+               f"(appears most across the evidence).") if people else "Suggested next step: read the cited sources."
+        return "\n".join(lines) + "\n\n" + nxt

@@ -18,6 +18,10 @@ export interface ContributorNode {
   y?: number;
   fx?: number | null;
   fy?: number | null;
+  total_commits?: number | null;
+  window_commits?: number;
+  reviews_received?: number;
+  exclusive_files?: number;
 }
 
 export interface FileNode {
@@ -26,11 +30,12 @@ export interface FileNode {
   label: string;
   full_path: string;
   language: string;
-  lines: number;
+  lines?: number | null;
   color: string;
   file_url?: string;
   x?: number;
   y?: number;
+  commits?: number;
   fx?: number | null;
   fy?: number | null;
 }
@@ -47,6 +52,10 @@ export interface AstFunctionNode {
   y?: number;
   fx?: number | null;
   fy?: number | null;
+  name?: string;
+  owner?: string | null;
+  ownership_pct?: number | null;
+  ownership_basis?: string;
 }
 
 export type GraphNode = ContributorNode | FileNode | AstFunctionNode;
@@ -62,6 +71,8 @@ export interface GraphEdge {
   color: string;
   glow?: boolean;
   type?: string;
+  raw_weight?: number;
+  commits?: number;
 }
 
 export interface NetworkStats {
@@ -77,19 +88,23 @@ export interface AstFunction {
   start_line: number;
   end_line: number;
   parameters: string[];
-  primary_owner: string;
-  primary_ownership_pct: number;
+  primary_owner: string | null;
+  primary_ownership_pct: number | null;
   cyclomatic_complexity: number;
   docstring_preview: string;
   github_url?: string;
+  ownership_basis?: string;
 }
 
 export interface RepoFile {
   path: string;
   language: string;
-  lines: number;
   contributors: string[];
   file_url?: string;
+  lines?: number | null;
+  commits?: number;
+  contributor_commits?: Record<string, number>;
+
 }
 
 export interface CommitItem {
@@ -122,6 +137,7 @@ export interface RepoAnalysisData {
   files: RepoFile[];
   commits?: CommitItem[];
   prs?: PullRequestItem[];
+  data_source?: { token_used: boolean; blame_used: boolean; parser: string; warnings: string[]; fetched_at: string };
 }
 
 export interface GroundedEvidenceDoc {
@@ -130,6 +146,8 @@ export interface GroundedEvidenceDoc {
   type: string;
   citation: string;
   metadata: Record<string, any>;
+  url?: string;
+  people?: string[]
 }
 
 export interface RagResponse {
