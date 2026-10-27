@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ContributorNode, AstFunction, RagResponse, GraphNode, RepoAnalysisData } from '../types';
-import { Sparkles, MessageSquare, Code2, ShieldAlert, CheckCircle2, Send, BookmarkCheck, ArrowRight, ExternalLink, AlertTriangle } from 'lucide-react';
+import { Sparkles, MessageSquare, Code2, ShieldAlert, CheckCircle2, Send, BookmarkCheck, ArrowRight, ExternalLink, AlertTriangle, X } from 'lucide-react';
 
 interface XAiCardProps {
   node: GraphNode;
